@@ -283,10 +283,42 @@ static inline bool pipe_readable(const struct pipe_inode_info *pipe)
 	return !pipe_empty(head, tail) || !writers;
 }
 
+#define MCLAZY(a, b, c) asm volatile(".byte 0x0F, 0x0A" : : "D"(a), "S"(b), "d"(c));
+#define	_mm_clwb(addr)\
+	asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)));
+#define	_mm_sfence()\
+	asm volatile("sfence;");
+
+static void lazy_copy_page(void *to, void *from, size_t size)
+{
+	size_t left_fringe = 64 - ((uint64_t)to & 63);
+	size_t right_fringe = (uint64_t)((size - left_fringe) & 63);
+	int i;
+	memcpy(to, from, left_fringe);
+	for(i = 0; i < size - left_fringe - right_fringe; i += 64)
+		_mm_clwb(from + left_fringe + i);
+	_mm_sfence();
+	MCLAZY(to + left_fringe, from + left_fringe, size - left_fringe - right_fringe);
+	memcpy(to + size - right_fringe, from + size - right_fringe, right_fringe);
+	_mm_sfence();
+}
+
+static void update_iov_iter(struct iov_iter *iter, size_t copy_size)
+{
+	size_t skip = iter->iov_offset + copy_size;
+	if (skip == iter->iov->iov_len) {
+		iter->iov++;
+		iter->nr_segs--;
+		skip = 0;
+	}
+	iter->count -= copy_size;
+	iter->iov_offset = skip;
+}
 static ssize_t
 pipe_read(struct kiocb *iocb, struct iov_iter *to)
 {
 	size_t total_len = iov_iter_count(to);
+	size_t copy_len = total_len;
 	struct file *filp = iocb->ki_filp;
 	struct pipe_inode_info *pipe = filp->private_data;
 	bool was_full, wake_next_reader = false;
@@ -329,7 +361,20 @@ pipe_read(struct kiocb *iocb, struct iov_iter *to)
 				break;
 			}
 
-			written = copy_page_to_iter(buf->page, buf->offset, chars, to);
+			if(unlikely(copy_len == 65536)) {
+				void *kaddr, *from;
+				size_t copy_size = min(chars, to->iov->iov_len - to->iov_offset);
+				if (unlikely(copy_size > to->count))
+					copy_size = to->count;
+				kaddr = kmap_atomic(buf->page);
+				from = kaddr + buf->offset;
+				lazy_copy_page(to->iov->iov_base + to->iov_offset, from, copy_size);
+				kunmap_atomic(kaddr);
+				update_iov_iter(to, copy_size);
+				written = copy_size;
+			}
+			else
+				written = copy_page_to_iter(buf->page, buf->offset, chars, to);
 			if (unlikely(written < chars)) {
 				if (!ret)
 					ret = -EFAULT;
@@ -443,6 +488,7 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 	unsigned int head;
 	ssize_t ret = 0;
 	size_t total_len = iov_iter_count(from);
+	size_t copy_len = total_len;
 	ssize_t chars;
 	bool was_empty = false;
 	bool wake_next_writer = false;
@@ -482,8 +528,20 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			ret = pipe_buf_confirm(pipe, buf);
 			if (ret)
 				goto out;
-
-			ret = copy_page_from_iter(buf->page, offset, chars, from);
+			if(unlikely(copy_len == 65536)) {
+				void *kaddr, *to;
+				size_t copy_size = min(chars, from->iov->iov_len - from->iov_offset);
+				if (unlikely(copy_size > from->count))
+					copy_size = from->count;
+				kaddr = kmap_atomic(buf->page);
+				to = kaddr + offset;
+				lazy_copy_page(to, from->iov->iov_base + from->iov_offset, copy_size);
+				kunmap_atomic(kaddr);
+				update_iov_iter(from, copy_size);
+				ret = copy_size;
+			}
+			else
+				ret = copy_page_from_iter(buf->page, offset, chars, from);
 			if (unlikely(ret < chars)) {
 				ret = -EFAULT;
 				goto out;
@@ -548,7 +606,19 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			}
 			pipe->tmp_page = NULL;
 
-			copied = copy_page_from_iter(page, 0, PAGE_SIZE, from);
+			if(unlikely(copy_len == 65536)) {
+				void *to;
+				size_t copy_size = min(PAGE_SIZE, from->iov->iov_len - from->iov_offset);
+				if (unlikely(copy_size > from->count))
+					copy_size = from->count;
+				to = kmap_atomic(page);
+				lazy_copy_page(to, from->iov->iov_base + from->iov_offset, copy_size);
+				kunmap_atomic(to);
+				update_iov_iter(from, copy_size);
+				copied = copy_size;
+			}
+			else
+				copied = copy_page_from_iter(page, 0, PAGE_SIZE, from);
 			if (unlikely(copied < PAGE_SIZE && iov_iter_count(from))) {
 				if (!ret)
 					ret = -EFAULT;
