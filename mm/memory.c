@@ -2397,6 +2397,7 @@ static inline int pte_unmap_same(struct mm_struct *mm, pmd_t *pmd,
 	return same;
 }
 
+#define MCLAZY(a, b, c) asm volatile(".byte 0x0F, 0x0A" : : "D"(a), "S"(b), "d"(c));
 static inline bool cow_user_page(struct page *dst, struct page *src,
 				 struct vm_fault *vmf)
 {
@@ -4944,11 +4945,12 @@ void copy_user_huge_page(struct page *dst, struct page *src,
 {
 	unsigned long addr = addr_hint &
 		~(((unsigned long)pages_per_huge_page << PAGE_SHIFT) - 1);
-	struct copy_subpage_arg arg = {
+	char *vfrom, *vto;
+	/*struct copy_subpage_arg arg = {
 		.dst = dst,
 		.src = src,
 		.vma = vma,
-	};
+	};*/
 
 	if (unlikely(pages_per_huge_page > MAX_ORDER_NR_PAGES)) {
 		copy_user_gigantic_page(dst, src, addr, vma,
@@ -4956,7 +4958,13 @@ void copy_user_huge_page(struct page *dst, struct page *src,
 		return;
 	}
 
-	process_huge_page(addr_hint, pages_per_huge_page, copy_subpage, &arg);
+	vfrom = kmap_atomic(src);
+	vto = kmap_atomic(dst);
+	MCLAZY(vto, vfrom, pages_per_huge_page << PAGE_SHIFT);
+	//copy_user_page(vto, vfrom, vaddr, to);
+	kunmap_atomic(vto);
+	kunmap_atomic(vfrom);
+	//process_huge_page(addr_hint, pages_per_huge_page, copy_subpage, &arg);
 }
 
 long copy_huge_page_from_user(struct page *dst_page,
