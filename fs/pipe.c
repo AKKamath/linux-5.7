@@ -303,6 +303,14 @@ static void lazy_copy_page(void *to, void *from, size_t size)
 	_mm_sfence();
 }
 
+static void lazy_free_page(void *from, size_t size)
+{
+	if(size) {
+		MCLAZY(from, NULL, size);
+		_mm_sfence();
+	}
+}
+
 static void update_iov_iter(struct iov_iter *iter, size_t copy_size)
 {
 	size_t skip = iter->iov_offset + copy_size;
@@ -360,8 +368,7 @@ pipe_read(struct kiocb *iocb, struct iov_iter *to)
 					ret = error;
 				break;
 			}
-
-			if(unlikely(copy_len == 65536)) {
+			if(unlikely(((copy_len + 3) % 1024) == 0)) {
 				void *kaddr, *from;
 				size_t copy_size = min(chars, to->iov->iov_len - to->iov_offset);
 				if (unlikely(copy_size > to->count))
@@ -369,6 +376,8 @@ pipe_read(struct kiocb *iocb, struct iov_iter *to)
 				kaddr = kmap_atomic(buf->page);
 				from = kaddr + buf->offset;
 				lazy_copy_page(to->iov->iov_base + to->iov_offset, from, copy_size);
+				// Free the buffer that's no longer going to be read from
+				lazy_free_page(from, copy_size);
 				kunmap_atomic(kaddr);
 				update_iov_iter(to, copy_size);
 				written = copy_size;
@@ -528,7 +537,7 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			ret = pipe_buf_confirm(pipe, buf);
 			if (ret)
 				goto out;
-			if(unlikely(copy_len == 65536)) {
+			if(unlikely(((copy_len + 3) % 1024) == 0)) {
 				void *kaddr, *to;
 				size_t copy_size = min(chars, from->iov->iov_len - from->iov_offset);
 				if (unlikely(copy_size > from->count))
@@ -606,7 +615,7 @@ pipe_write(struct kiocb *iocb, struct iov_iter *from)
 			}
 			pipe->tmp_page = NULL;
 
-			if(unlikely(copy_len == 65536)) {
+			if(unlikely(((copy_len + 3) % 1024) == 0)) {
 				void *to;
 				size_t copy_size = min(PAGE_SIZE, from->iov->iov_len - from->iov_offset);
 				if (unlikely(copy_size > from->count))
